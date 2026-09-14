@@ -1,6 +1,7 @@
 ## Aircraft radar system in JavaScript
 
-![Demo of the airplanes tracker. After clicking on a button to start the connection with the RTL-SDR USB device, live data from an airplane is being displayed on the screen, include raw latitude, longitude, altitude.](demo.gif)
+<img width="1219" height="867" alt="image" src="https://github.com/user-attachments/assets/d528cb70-9ba5-4e92-8f4f-ee46e2bd0977" />
+
 
 This project uses the [Web USB API](https://developer.mozilla.org/en-US/docs/Web/API/USB), a [RTL-SDR dongle + antenna](https://www.rtl-sdr.com/buy-rtl-sdr-dvb-t-dongles/) and some vanilla JS code.
 

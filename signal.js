@@ -25,6 +25,7 @@ const PX_PER_SAMPLE = 4; // Fixed scale: one bit is 8 px, one byte 64 px.
 const DETAIL_SAMPLES = CONTEXT_SAMPLES * 2 + PREAMBLE_SAMPLES + 112 * 2; // Fits a long message.
 const MAX_BUFFERS = 32; // Recent buffers kept for the overview (~2 s).
 const MAX_HISTORY = 2000; // Recent message snippets kept for export (~1 MB).
+const RECORD_SECONDS = 10; // Raw I/Q recording length (4 MB per second).
 const CENTER_FREQUENCY = 1_090_000_000;
 
 const SDD_EXPLANATION =
@@ -59,7 +60,11 @@ function describeDecoded(mm) {
 }
 
 function download(name, object) {
-  const url = URL.createObjectURL(new Blob([JSON.stringify(object)], { type: "application/json" }));
+  downloadBlob(name, new Blob([JSON.stringify(object)], { type: "application/json" }));
+}
+
+function downloadBlob(name, blob) {
+  const url = URL.createObjectURL(blob);
   const a = Object.assign(document.createElement("a"), { href: url, download: name });
   document.body.appendChild(a);
   a.click();
@@ -241,7 +246,7 @@ const escapeHtml = (text) =>
   String(text).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 
 export class SignalView {
-  constructor(container, { onHover, onField, onFreeze, onShow, onLock, onUnlock }) {
+  constructor(container, { onHover, onField, onFreeze, onShow, onLock, onUnlock, onDetector }) {
     this._onHover = onHover; // (message | null) — a message in the overview
     this._onField = onField; // (message | null, columns) — a part of the detailed message
     this._onFreeze = onFreeze; // (frozen)
@@ -266,6 +271,15 @@ export class SignalView {
         <span class="signal-title">I/Q signal</span>
         <span class="signal-info"></span>
         <span class="signal-actions">
+          <label class="signal-detector" title="Message detection. Hybrid: classic detection plus a tolerant detector for messages that start part-way into a sample (about 20 % more messages on real recordings). Switch to compare messages per second live.">
+            Detector
+            <select>
+              <option value="hybrid">hybrid</option>
+              <option value="classic">classic</option>
+              <option value="tolerant">tolerant</option>
+            </select>
+          </label>
+          <button class="signal-button" data-record title="Record ${RECORD_SECONDS} s of raw I/Q from the receiver (uint8 I/Q at 2 Msps, like rtl_sdr) — put it in tests/fixtures to test detection against it">Record ${RECORD_SECONDS} s</button>
           <button class="signal-button" data-export="messages" title="Download the samples around the most recent messages (valid, repaired and corrupt) with what the decoder made of them, as JSON for tests">Export messages</button>
           <button class="signal-button" data-export="buffer" title="Download the whole buffer shown in the overview (64 ms of raw I/Q) with its messages, as JSON">Export buffer</button>
         </span>
@@ -287,7 +301,12 @@ export class SignalView {
       const kind = event.target.closest("[data-export]")?.dataset.export;
       if (kind === "messages") this.exportMessages();
       if (kind === "buffer") this.exportBuffer();
+      if (event.target.closest("[data-record]")) this.record();
     });
+    this._detectorSelect = container.querySelector(".signal-detector select");
+    this._detectorSelect.addEventListener("change", () => onDetector?.(this._detectorSelect.value));
+    this._recordButton = container.querySelector("[data-record]");
+    this._recording = null; // { chunks, bytes }
     this._overview = container.querySelector(".signal-overview");
     this._detailTitle = container.querySelector(".signal-detail-title");
     this._detail = container.querySelector(".signal-detail");
@@ -335,6 +354,7 @@ export class SignalView {
   // Feed one buffer of interleaved unsigned 8-bit I/Q samples and the
   // messages found in it (valid and corrupt).
   push(data, messages) {
+    if (this._recording) this._recordBuffer(data);
     const buffer = { data, messages, sequence: this._sequence++, receivedAt: new Date() };
     // Keep each message's own samples (small), so it can be shown later, e.g.
     // when its row in the table is hovered — even while the view is paused.
@@ -361,6 +381,32 @@ export class SignalView {
 
   // Samples around recent messages, oldest first. Replaying a snippet through
   // the demodulator reproduces the message (see tests/).
+  setDetector(detector) {
+    this._detectorSelect.value = detector;
+  }
+
+  // Record raw I/Q buffers as they arrive (also while paused), then download
+  // them as one .bin file.
+  record() {
+    if (this._recording) return;
+    this._recording = { chunks: [], bytes: 0 };
+    this._recordButton.disabled = true;
+    this._recordButton.textContent = "Recording…";
+  }
+
+  _recordBuffer(data) {
+    const recording = this._recording;
+    recording.chunks.push(data);
+    recording.bytes += data.length;
+    const seconds = recording.bytes / (SAMPLE_RATE * 2);
+    this._recordButton.textContent = `Recording ${seconds.toFixed(1)} s`;
+    if (seconds < RECORD_SECONDS) return;
+    downloadBlob(`adsb-iq-${timestamp()}-2Msps-1090MHz.bin`, new Blob(recording.chunks, { type: "application/octet-stream" }));
+    this._recording = null;
+    this._recordButton.disabled = false;
+    this._recordButton.textContent = `Record ${RECORD_SECONDS} s`;
+  }
+
   exportMessages() {
     download(`adsb-iq-messages-${timestamp()}.json`, {
       format: "webusb-rtlsdr-adsb/iq-messages",

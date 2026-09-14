@@ -37,6 +37,13 @@ export function Demodulator(opts) {
     this._mag = opts.mag || null; // pre-initialized magnitute Uint16Array used by `process` (optional)
 
     this._decoder = new Decoder(opts);
+
+    // "hybrid" (default), "classic" or "tolerant" message detection; see
+    // detectHybrid.
+    this.detector = opts.detector ?? "hybrid";
+    this._pulseRatio = opts.pulseRatio ?? TOLERANT_PULSE_RATIO;
+    this._minPulseRatio = opts.minPulseRatio ?? TOLERANT_MIN_PULSE_RATIO;
+    this._minMargin = opts.minMargin ?? TOLERANT_MIN_MARGIN;
 }
 
 // `onCorrupt` (optional) receives messages whose checksum still fails after
@@ -49,7 +56,9 @@ Demodulator.prototype.process = function (data, size, onMsg, onCorrupt) {
     if (!this._mag) this._mag = new Uint16Array(size / 2);
 
     this.computeMagnitudeVector(data, this._mag, size);
-    this.detectMessage(this._mag, size / 2, onMsg, onCorrupt);
+    if (this.detector === "classic") this.detectMessage(this._mag, size / 2, onMsg, onCorrupt);
+    else if (this.detector === "tolerant") this.detectTolerant(this._mag, size / 2, onMsg, onCorrupt);
+    else this.detectHybrid(this._mag, size / 2, onMsg, onCorrupt);
 };
 
 // Turn I/Q samples pointed by `data` into the magnitude vector pointed by `mag`
@@ -84,7 +93,7 @@ Demodulator.prototype.computeMagnitudeVector = function (
     }
 };
 
-// Detect a Mode S messages inside the magnitude buffer pointed by 'mag' and of
+// Classic detection (from dump1090). Detect a Mode S messages inside the magnitude buffer pointed by 'mag' and of
 // size 'maglen' bytes. Every detected Mode S message is convert it into a
 // stream of bits and passed to the function to display it.
 Demodulator.prototype.detectMessage = function (mag, maglen, onMsg, onCorrupt) {
@@ -277,6 +286,125 @@ Demodulator.prototype.detectMessage = function (mag, maglen, onMsg, onCorrupt) {
             useCorrection = true;
         } else {
             useCorrection = false;
+        }
+    }
+};
+
+// Tolerant detection and bit decisions for messages that don't start exactly
+// on a sample. At 2 Msps a 0.5 µs pulse lasts one sample, but it usually
+// starts part-way into one, so its energy is split over two samples. The
+// classic detector demands a strict up/down pattern over the preamble and
+// compares two samples per bit, which both break down when energy is split —
+// on realistic signals it missed about a third of strong messages.
+//
+// Here the preamble must stand out as a whole: the energy at the four pulse
+// positions is a local maximum over neighbouring alignments and clearly above
+// the samples that stay quiet however the energy is split. The fraction of a
+// sample the message starts late (0–0.5) and the pulse amplitude are estimated
+// from the preamble, and each bit is decided after subtracting the previous
+// bit's pulse that spills into it. The decision margin doubles as the bit's
+// certainty for soft-decision decoding. Tuned on synthetic signals with
+// random sub-sample timing and on pure noise (see tests/).
+const TOLERANT_PULSE_RATIO = 2.0; // Average pulse vs quiet level.
+const TOLERANT_MIN_PULSE_RATIO = 1.0; // Weakest pulse vs quiet level.
+const TOLERANT_MIN_MARGIN = 0.5; // Average decision margin over the first 56 bits, relative to the amplitude.
+const MIN_PULSE = 360; // Magnitude units: one unit of I/Q amplitude.
+
+// Hybrid detection: the classic detector first, then the tolerant one for
+// signals the classic one didn't decode. On 80 s of real RTL-SDR recordings
+// the two found largely different messages; together about 22 % more than
+// classic alone, without losing any. Extra messages that needed a repair are
+// only kept for aircraft already known, because the tolerant detector's many
+// extra candidates give chance repairs more opportunities.
+Demodulator.prototype.detectHybrid = function (mag, maglen, onMsg, onCorrupt) {
+    const found = [];
+    const corrupt = [];
+    this.detectMessage(mag, maglen, (mm) => found.push(mm), (mm) => corrupt.push(mm));
+
+    const decoded = found.map((mm) => [mm.sampleOffset, mm.sampleOffset + mm.sampleLength]);
+    const overlaps = (ranges, start, end) => ranges.some(([a, b]) => start < b && end > a);
+    const extra = [];
+    this.detectTolerant(mag, maglen, (mm) => {
+        if (mm.fixMethod && !this._decoder._icaoAddrWasRecentlySeen(mm.icao)) return;
+        extra.push(mm);
+    }, undefined, {
+        skip: (start) => overlaps(decoded, start, start + 32), // Already decoded here.
+        retry: true, // The classic detector may have parsed this signal already.
+    });
+
+    const messages = [...found, ...extra].sort((a, b) => a.sampleOffset - b.sampleOffset);
+    for (const mm of messages) onMsg(mm);
+    if (onCorrupt) {
+        const valid = extra.map((mm) => [mm.sampleOffset, mm.sampleOffset + mm.sampleLength]);
+        for (const mm of corrupt) {
+            if (!overlaps(valid, mm.sampleOffset, mm.sampleOffset + mm.sampleLength)) onCorrupt(mm);
+        }
+    }
+};
+
+// `options.skip(start)`: skip a candidate starting at this sample.
+// `options.retry`: tell the decoder the signal may have been decoded before.
+Demodulator.prototype.detectTolerant = function (mag, maglen, onMsg, onCorrupt, options = {}) {
+    const { skip, retry = false } = options;
+    const bits = new Uint8Array(long_msg_bits);
+    const msg = new Uint8Array(long_msg_bits / 8);
+    const confidence = new Uint16Array(long_msg_bits);
+
+    for (let j = 1; j < maglen - FULL_LEN * 2 - 2; j++) {
+        // Preamble pulses at samples 0, 2, 7 and 9: a local maximum of energy.
+        const pulse = mag[j] + mag[j + 2] + mag[j + 7] + mag[j + 9];
+        if (pulse < mag[j - 1] + mag[j + 1] + mag[j + 6] + mag[j + 8]) continue;
+        const spill = mag[j + 1] + mag[j + 3] + mag[j + 8] + mag[j + 10];
+        if (pulse <= spill) continue;
+
+        // Samples 4–5 and 11–14 are quiet whichever way the energy is split.
+        const quiet = (mag[j + 4] + mag[j + 5] + mag[j + 11] + mag[j + 12] + mag[j + 13] + mag[j + 14]) / 6;
+        if (pulse / 4 < this._pulseRatio * quiet + MIN_PULSE) continue;
+        if (Math.min(mag[j], mag[j + 2], mag[j + 7], mag[j + 9]) < this._minPulseRatio * quiet) continue;
+
+        if (skip && skip(j)) continue;
+
+        // Pulse amplitude, and how far into sample j the message starts.
+        const amplitude = Math.max(1, (pulse + spill) / 4 - quiet);
+        const late = Math.max(0, Math.min(0.5, (spill / 4 - quiet) / amplitude));
+
+        // A 1 has its pulse in the first half, a 0 in the second. The previous
+        // bit's second-half pulse spills `late` of its energy into this bit's
+        // first sample, which moves the decision threshold.
+        let previousSecondHalf = 0;
+        let marginSum = 0;
+        const threshold = (-late * amplitude) / 2;
+        const scale = (1 - late / 2) * amplitude;
+        for (let b = 0; b < long_msg_bits; b++) {
+            const first = mag[j + 16 + 2 * b] - quiet - late * amplitude * previousSecondHalf;
+            const second = mag[j + 17 + 2 * b] - quiet;
+            const difference = first - second;
+            const bit = difference > threshold ? 1 : 0;
+            const margin = Math.abs(difference - threshold) / scale;
+            bits[b] = bit;
+            confidence[b] = Math.min(4096, Math.round(margin * 4096));
+            if (b < short_msg_bits) marginSum += Math.min(1, margin);
+            previousSecondHalf = bit ? 0 : 1;
+        }
+        // Quality: noise that looks like a preamble gives near-random decisions.
+        if (marginSum / short_msg_bits < this._minMargin) continue;
+
+        for (let i = 0; i < long_msg_bits; i += 8) {
+            msg[i / 8] =
+                (bits[i] << 7) | (bits[i + 1] << 6) | (bits[i + 2] << 5) | (bits[i + 3] << 4) |
+                (bits[i + 4] << 3) | (bits[i + 5] << 2) | (bits[i + 6] << 1) | bits[i + 7];
+        }
+        const msglen = msgLen(msg[0] >> 3) / 8;
+        const mm = this._decoder.parse(msg, this._crcOnly, confidence, retry);
+        mm.sampleOffset = j;
+        mm.sampleLength = (PREAMBLE_US + msglen * 8) * 2;
+        mm.msg = msg.slice(0, msglen);
+
+        if (mm.crcOk || !this._checkCrc) {
+            onMsg(mm);
+            j += mm.sampleLength - 1; // Continue after this message.
+        } else if (onCorrupt) {
+            onCorrupt(mm);
         }
     }
 };

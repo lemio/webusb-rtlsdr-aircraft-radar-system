@@ -1,13 +1,18 @@
-// Tests for error correction, in particular soft-decision decoding (SDD).
+// Tests for message detection and error correction, in particular
+// soft-decision decoding (SDD).
 //
 // Run from the repository root with:  node --test
 //
-// 1. Synthetic signals with a known number of weakly received wrong bits.
+// 1. Synthetic signals with a known number of weakly received wrong bits, and
+//    with messages starting part-way into a sample.
 // 2. Replays of real signals exported from the app ("Export messages" or
 //    "Export buffer" in the signal panel) placed in tests/fixtures/. A replay
 //    checks that messages which decoded cleanly still decode identically, and
 //    reports how repairs changed compared to the decoder that exported them —
 //    so the decoder can be improved against real recordings.
+// 3. Raw recordings (tests/fixtures/*.bin: uint8 I/Q at 2 Msps, as saved by
+//    "Record" in the app or by `rtl_sdr -f 1090000000 -s 2000000`), replayed
+//    through the classic and hybrid detectors.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -84,6 +89,38 @@ function synthesize(hex, { amplitude = 50, noise = 2, weakWrongBits = [], strong
 }
 
 const clamp = (v) => Math.max(0, Math.min(255, Math.round(v)));
+
+// Messages starting at a fraction of a sample: each 0.5 µs pulse then spreads
+// its energy over two samples, as it usually does with a real receiver.
+function synthesizeSplit(messages, { noise = 4, seed = 1, samples = 20000 } = {}) {
+  const gauss = random(seed);
+  const re = new Float32Array(samples);
+  const im = new Float32Array(samples);
+  for (const { hex, start, amplitude } of messages) {
+    const bytes = hexBytes(hex);
+    const pulses = [[0, 1], [2, 3], [7, 8], [9, 10]]; // In samples, from the message start.
+    for (let b = 0; b < bytes.length * 8; b++) {
+      const first = 16 + 2 * b;
+      pulses.push(bitOf(bytes, b) ? [first, first + 1] : [first + 1, first + 2]);
+    }
+    const phase = start * 1.7;
+    for (const [p0, p1] of pulses) {
+      const s0 = start + p0;
+      const s1 = start + p1;
+      for (let n = Math.floor(s0); n < Math.ceil(s1); n++) {
+        const overlap = Math.min(s1, n + 1) - Math.max(s0, n);
+        re[n] += amplitude * overlap * Math.cos(phase + n * 0.3);
+        im[n] += amplitude * overlap * Math.sin(phase + n * 0.3);
+      }
+    }
+  }
+  const data = new Uint8Array(samples * 2);
+  for (let n = 0; n < samples; n++) {
+    data[n * 2] = clamp(127.5 + re[n] + gauss() * noise);
+    data[n * 2 + 1] = clamp(127.5 + im[n] + gauss() * noise);
+  }
+  return data;
+}
 
 function decode(demodulator, data) {
   const valid = [];
@@ -163,6 +200,23 @@ test("a damaged all-call reply is only repaired for an aircraft already seen", (
   assert.deepEqual(known.valid[0].fixedBits, [20]);
 });
 
+test("the hybrid detector decodes messages starting part-way into a sample", () => {
+  // 30 messages at start fractions 0, 1/30, 2/30, …
+  const messages = [];
+  for (let k = 0; k < 30; k++) {
+    messages.push({ hex: MESSAGES.position, start: 200 + k * 600 + k / 30, amplitude: 20 });
+  }
+  const data = synthesizeSplit(messages, { noise: 4, seed: 3 });
+  const decoded = (detector) => {
+    const found = decode(new Demodulator({ detector }), data).valid.filter((mm) => toHex(mm.msg) === MESSAGES.position);
+    return new Set(found.map((mm) => Math.round((mm.sampleOffset - 200) / 600)));
+  };
+  const classic = decoded("classic");
+  const hybrid = decoded("hybrid");
+  for (const k of classic) assert.ok(hybrid.has(k), `hybrid misses message ${k} that classic decodes`);
+  assert.ok(hybrid.size > classic.size, `hybrid ${hybrid.size} should decode more than classic ${classic.size}`);
+});
+
 test("pure noise never produces messages", () => {
   const demodulator = new Demodulator();
   decode(demodulator, synthesize(MESSAGES.position)); // Make an aircraft known, the harder case.
@@ -181,6 +235,7 @@ test("pure noise never produces messages", () => {
 
 const fixtures = new URL("./fixtures/", import.meta.url);
 const files = existsSync(fixtures) ? readdirSync(fixtures).filter((f) => f.endsWith(".json")) : [];
+const recordings = existsSync(fixtures) ? readdirSync(fixtures).filter((f) => f.endsWith(".bin")) : [];
 
 const SNIPPET_SAMPLES = 320; // Snippets are padded to one size (the demodulator keeps its buffer).
 
@@ -236,4 +291,34 @@ function replayBuffer(demodulator, recording) {
     before: message.decoded,
     after: [...valid, ...corrupt].find((mm) => mm.sampleOffset === message.sampleOffset),
   }));
+}
+
+// --- Raw recordings: classic vs hybrid detection ------------------------------
+
+const BUFFER_BYTES = 256000; // 64 ms, as read by the app.
+
+for (const file of recordings) {
+  test(`raw recording ${file}: the hybrid detector keeps every classic message`, (t) => {
+    const raw = readFileSync(new URL(file, fixtures));
+    const run = (detector) => {
+      const demodulator = new Demodulator({ detector });
+      const messages = [];
+      for (let offset = 0; offset + BUFFER_BYTES <= raw.length; offset += BUFFER_BYTES) {
+        const data = new Uint8Array(raw.buffer, raw.byteOffset + offset, BUFFER_BYTES).slice();
+        demodulator.process(data, data.length, (mm) => {
+          messages.push({ position: offset / 2 + mm.sampleOffset, content: content(toHex(mm.msg)), mm });
+        });
+      }
+      return messages;
+    };
+    const classic = run("classic");
+    const hybrid = run("hybrid");
+    const same = (a, b) => Math.abs(a.position - b.position) <= 3 && a.content === b.content;
+    const missing = classic.filter((m) => !hybrid.some((n) => same(m, n)));
+    const extra = hybrid.filter((m) => !classic.some((n) => same(m, n)));
+    const seconds = raw.length / BUFFER_BYTES * 0.064;
+    t.diagnostic(`${seconds.toFixed(0)} s: classic ${classic.length}, hybrid ${hybrid.length} ` +
+      `(${extra.length} extra, ${missing.length} missing; DF17 ${classic.filter((m) => m.mm.msgtype === 17).length} → ${hybrid.filter((m) => m.mm.msgtype === 17).length})`);
+    assert.equal(missing.length, 0, "the hybrid detector lost messages the classic one decodes");
+  });
 }

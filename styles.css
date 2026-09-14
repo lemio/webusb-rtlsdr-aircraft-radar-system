@@ -426,6 +426,24 @@ p {
     background: rgba(255, 255, 255, 0.14);
 }
 
+.signal-button:disabled {
+    color: #ffe14d;
+    border-color: rgba(255, 225, 77, 0.6);
+}
+
+.signal-detector {
+    color: var(--muted);
+}
+
+.signal-detector select {
+    font: 400 11px system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: var(--ink);
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 3px;
+    margin-left: .3em;
+}
+
 .signal-info,
 .signal-muted {
     color: var(--muted);

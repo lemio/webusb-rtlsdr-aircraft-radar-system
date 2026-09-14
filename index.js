@@ -13,6 +13,11 @@ let started = false;
 let msgReceived = false;
 
 const demodulator = new Demodulator();
+const DETECTOR_KEY = "detector";
+try {
+    const saved = localStorage.getItem(DETECTOR_KEY);
+    if (["hybrid", "classic", "tolerant"].includes(saved)) demodulator.detector = saved;
+} catch {}
 const tracker = new AircraftTracker();
 let aircraftMap;
 
@@ -132,7 +137,14 @@ const signalView = new SignalView(document.querySelector('#signal'), {
     // Locking a message pauses everything; releasing it goes live.
     onLock: () => setPaused(true),
     onUnlock: () => setPaused(false),
+    // Message detection can be switched live, to compare.
+    onDetector: detector => {
+        demodulator.detector = detector;
+        try { localStorage.setItem(DETECTOR_KEY, detector); } catch {}
+    },
 });
+
+signalView.setDetector(demodulator.detector);
 
 // Message rate, so it's clear how fast data is really coming in.
 const rateElement = document.createElement('p');

@@ -80,9 +80,9 @@ export function Decoder(opts) {
 // detect(), and split it into fields populating a Message object.
 // `confidence` (optional): per bit, how clearly it was received — the
 // magnitude difference between its two halves. Enables soft-decision repair.
-// `retry`: the same message is decoded again (e.g. after phase correction).
+// `retry`: this signal was already decoded once (e.g. after phase correction,
+// or by another detector).
 Decoder.prototype.parse = function (msg, crcOnly, confidence, retry = false) {
-  if (!retry) this._lastInterrogated = null;
   const mm = new Message();
 
   mm.msg = msg;
@@ -365,8 +365,9 @@ Decoder.prototype._bruteForceAp = function (msg, mm) {
 // (within ICAO_CACHE_TTL). The second one confirms the address, which then
 // counts as recently seen. The first one is only remembered.
 Decoder.prototype._confirmInterrogatedAddress = function (addr, retry) {
-  // A retry of the message that was just remembered is not a second reply.
-  if (retry && addr === this._lastInterrogated) return false;
+  // A message decoded again (a retry, or a second detector looking at the
+  // same signal) is not a second reply.
+  if (retry) return false;
   const now = (Date.now() / 1000) >> 0;
   const first = this._interrogatedAddresses.get(addr);
   if (first !== undefined && now - first <= ICAO_CACHE_TTL) {
@@ -376,7 +377,6 @@ Decoder.prototype._confirmInterrogatedAddress = function (addr, retry) {
   }
   if (this._interrogatedAddresses.size > 4096) this._interrogatedAddresses.clear(); // Mostly chance matches.
   this._interrogatedAddresses.set(addr, now);
-  this._lastInterrogated = addr;
   return false;
 };
 

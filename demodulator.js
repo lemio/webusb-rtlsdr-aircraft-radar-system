@@ -39,7 +39,9 @@ export function Demodulator(opts) {
     this._decoder = new Decoder(opts);
 }
 
-Demodulator.prototype.process = function (data, size, onMsg) {
+// `onCorrupt` (optional) receives messages whose checksum still fails after
+// error correction and a retry with phase correction.
+Demodulator.prototype.process = function (data, size, onMsg, onCorrupt) {
     // If no pre-initialized magnitute array have been given upon initialization,
     // initialize one the first time `process` is called with the expectation
     // that all subsequent calls will not contain data of a larger size than the
@@ -47,7 +49,7 @@ Demodulator.prototype.process = function (data, size, onMsg) {
     if (!this._mag) this._mag = new Uint16Array(size / 2);
 
     this.computeMagnitudeVector(data, this._mag, size);
-    this.detectMessage(this._mag, size / 2, onMsg);
+    this.detectMessage(this._mag, size / 2, onMsg, onCorrupt);
 };
 
 // Turn I/Q samples pointed by `data` into the magnitude vector pointed by `mag`
@@ -85,7 +87,7 @@ Demodulator.prototype.computeMagnitudeVector = function (
 // Detect a Mode S messages inside the magnitude buffer pointed by 'mag' and of
 // size 'maglen' bytes. Every detected Mode S message is convert it into a
 // stream of bits and passed to the function to display it.
-Demodulator.prototype.detectMessage = function (mag, maglen, onMsg) {
+Demodulator.prototype.detectMessage = function (mag, maglen, onMsg, onCorrupt) {
     const bits = new Uint8Array(long_msg_bits);
     const msg = new Uint8Array(long_msg_bits / 2);
     const aux = new Uint16Array(long_msg_bits * 2);
@@ -241,6 +243,13 @@ Demodulator.prototype.detectMessage = function (mag, maglen, onMsg) {
             // Parse the received message
             const mm = this._decoder.parse(msg, this._crcOnly);
 
+            // Where the message sits in this buffer, for visualising the signal
+            // (in magnitude samples; the I/Q byte offset is twice this). The
+            // bytes are copied because `msg` is reused for the next message.
+            mm.sampleOffset = j;
+            mm.sampleLength = (PREAMBLE_US + msglen * 8) * 2;
+            mm.msg = msg.slice(0, msglen);
+
             // Stop trying to apply error correction to message decoding if we
             // successfully validated the checksum
             if (mm.crcOk) {
@@ -254,6 +263,7 @@ Demodulator.prototype.detectMessage = function (mag, maglen, onMsg) {
             // error-correct it, in which case we might end up calling onMsg
             // again with the error corrected message?
             if (mm.crcOk || !this._checkCrc) onMsg(mm);
+            else if (useCorrection && onCorrupt) onCorrupt(mm);
         }
 
         // Retry with phase correction if possible.
@@ -320,7 +330,7 @@ function applyPhaseCorrection(mag, offset) {
 }
 
 function memcpy(dst, dstOffset, src, srcOffset, length) {
-    for (let i = srcOffset; i < length; i++) {
-        dst[dstOffset + i] = src[i];
+    for (let i = 0; i < length; i++) {
+        dst[dstOffset + i] = src[srcOffset + i];
     }
 }

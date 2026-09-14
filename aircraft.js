@@ -133,6 +133,7 @@ export class AircraftTracker {
       if (isOdd) plane.cprOdd = frame;
       else plane.cprEven = frame;
       this._updatePosition(plane, frame, isOdd, now);
+      if (plane.positionTime === now) mm.position = plane.position;
     }
 
     if (mm.msgtype === 17 && mm.metype === 19) {

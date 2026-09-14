@@ -2,6 +2,8 @@ let readSamples = true;
 import { Demodulator } from "./demodulator.js";
 import { AircraftTracker } from "./aircraft.js";
 import { AircraftMap } from "./map.js";
+import { MessageTable } from "./messages.js";
+import { SignalView } from "./signal.js";
 let button = document.querySelector("button");
 let introSection = document.querySelector('.intro');
 let mainSection = document.querySelector('.app');
@@ -22,9 +24,11 @@ window.addEventListener("pagehide", () => tracker.save());
 
 async function start() {
     const sdr = await RtlSdr.requestDevice();
+    // Otherwise the spacebar (pause) would press the connect button again.
+    button.blur();
     introSection.style.display = "none";
     footer.style.display = "none";
-    mainSection.style.display = "block";
+    mainSection.style.display = "flex";
 
     // The receiver's location lets single position frames be decoded right away.
     navigator.geolocation?.getCurrentPosition(({ coords }) => {
@@ -32,8 +36,11 @@ async function start() {
     });
 
     aircraftMap = new AircraftMap("map");
+    aircraftMap.map.on("rotate", () => messageTable.setBearing(aircraftMap.map.getBearing()));
     aircraftMap.update(tracker);
-    setInterval(() => aircraftMap.update(tracker), MAP_UPDATE_MS);
+    setInterval(() => {
+        if (!paused) aircraftMap.update(tracker);
+    }, MAP_UPDATE_MS);
 
     await sdr.open({
         ppm: 0.5
@@ -57,8 +64,30 @@ async function start() {
         const data = new Uint8Array(samples);
         // console.log(data)
 
-        demodulator.process(data, 256000, onMsg)
+        // Collect this buffer's messages (valid and corrupt) for the signal
+        // view. readSamples counts samples, so the buffer holds 256000 bytes.
+        const bufferMessages = [];
+        demodulator.process(data, data.length, msg => {
+            bufferMessages.push(msg);
+            onMsg(msg);
+        }, msg => {
+            if (!CHECKED_FORMATS.includes(msg.msgtype)) return;
+            bufferMessages.push(msg);
+            onCorrupt(msg);
+        });
+        signalView.push(data, bufferMessages);
     }
+}
+
+// Formats whose checksum can be verified on its own. Other formats XOR the
+// parity with the aircraft address, so a failure there usually just means the
+// aircraft hasn't been seen yet, not that the message is corrupt.
+const CHECKED_FORMATS = [11, 17, 18];
+
+// Corrupt messages are listed, but never reach the tracker or the map.
+const onCorrupt = (msg) => {
+    corruptCount++;
+    messageTable.add(msg, null);
 }
 
 const onMsg = (msg) => {
@@ -67,93 +96,81 @@ const onMsg = (msg) => {
         msgReceived = true;
     }
     const plane = tracker.update(msg);
-    if (plane?.position) aircraftMap?.flash(plane);
-    displayAircraftData(msg, plane);
-}
-
-
-// Show messages as they arrive. Hundreds can arrive per second, so they're
-// queued and written to the DOM once per animation frame, keeping only the
-// most recent lines.
-const MAX_LOG_LINES = 200;
-const dataElement = document.querySelector('.data');
-let pendingLines = [];
-let flushScheduled = false;
-let messageCount = 0;
-const lineTargets = new WeakMap(); // log line element → { hex, position, altitude }
-let hoveredLine = null;
-let followLog = true;
-
-// Hovering a line marks the related aircraft position on the map.
-dataElement.addEventListener('mouseover', event => {
-    const line = event.target.closest('.data > div');
-    if (line === hoveredLine) return;
-    hoveredLine?.classList.remove('hovered');
-    hoveredLine = line;
-    line?.classList.add('hovered');
-    aircraftMap?.highlight(line && lineTargets.get(line));
-});
-dataElement.addEventListener('mouseleave', () => {
-    hoveredLine?.classList.remove('hovered');
-    hoveredLine = null;
-    aircraftMap?.highlight(null);
-    flushLog();
-});
-// Stop auto-scrolling while the user scrolls back through the log.
-dataElement.addEventListener('scroll', () => {
-    followLog = dataElement.scrollTop + dataElement.clientHeight >= dataElement.scrollHeight - 4;
-});
-
-const displayAircraftData = (msg, plane) => {
+    msg.target = plane?.position && { hex: plane.hex, position: plane.position, altitude: plane.altitude };
+    if (plane?.position && !paused) aircraftMap?.flash(plane);
     messageCount++;
-    const fields = Object.entries(msg)
-        .filter(([key, value]) => key !== 'msg' && value !== null && value !== '')
-        .map(([key, value]) => `${key}: ${value}`);
-    pendingLines.push({
-        text: `${new Date().toLocaleTimeString()} ${fields.join(', ')}`,
-        // Where the aircraft was when this message arrived, for hovering.
-        target: plane?.position && {
-            hex: plane.hex,
-            position: plane.position,
-            altitude: plane.altitude,
-        },
-    });
-    // Animation frames pause in background tabs; don't let the queue grow.
-    if (pendingLines.length > MAX_LOG_LINES) pendingLines.shift();
-    if (!flushScheduled) {
-        flushScheduled = true;
-        requestAnimationFrame(flushLog);
-    }
+    messageTable.add(msg, plane);
 }
 
-const flushLog = () => {
-    flushScheduled = false;
-    // Pause while hovering so lines don't shift under the pointer; the newest
-    // lines are kept in pendingLines and shown when the pointer leaves.
-    if (hoveredLine) return;
-    const fragment = document.createDocumentFragment();
-    for (const { text, target } of pendingLines) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        if (target) {
-            div.className = 'has-location';
-            lineTargets.set(div, target);
-        }
-        fragment.appendChild(div);
-    }
-    pendingLines = [];
-    dataElement.appendChild(fragment);
-    while (dataElement.childElementCount > MAX_LOG_LINES) dataElement.firstChild.remove();
-    if (followLog) dataElement.scrollTop = dataElement.scrollHeight;
-}
+
+const messageTable = new MessageTable(document.querySelector('.data'), {
+    // Hovering a row marks the aircraft on the map and shows the message's
+    // signal underneath.
+    onHover: (target, msg) => {
+        aircraftMap?.highlight(target);
+        signalView.showMessage(msg);
+    },
+    // The chevron locks the message in the signal view.
+    onLock: msg => signalView.lock(msg),
+});
+let messageCount = 0;
+let corruptCount = 0;
+
+const signalView = new SignalView(document.querySelector('#signal'), {
+    // Hovering a message in the signal marks its aircraft on the map and its
+    // messages in the table.
+    onHover: msg => {
+        aircraftMap?.highlight(msg?.target);
+        messageTable.focusMessage(msg, ['icao']);
+    },
+    // Hovering a bit, byte or field highlights its meaning in the table.
+    onField: (msg, columns) => messageTable.focusMessage(msg, columns),
+    // Keep the table still while inspecting the signal.
+    onFreeze: frozen => messageTable.hold('signal', frozen),
+    // The table marks the row of the shown message with a chevron.
+    onShow: (msg, locked) => messageTable.markShown(msg, locked),
+    // Locking a message pauses everything; releasing it goes live.
+    onLock: () => setPaused(true),
+    onUnlock: () => setPaused(false),
+});
 
 // Message rate, so it's clear how fast data is really coming in.
 const rateElement = document.createElement('p');
 rateElement.className = 'rate';
-dataElement.before(rateElement);
+document.querySelector('.data').before(rateElement);
 setInterval(() => {
-    rateElement.textContent = `${messageCount} msg/s${hoveredLine ? ' · paused while hovering' : ''}`;
+    rateElement.textContent = `${messageCount} msg/s` +
+        (corruptCount ? ` · ${corruptCount} corrupt` : '') +
+        (paused ? ' · paused' : messageTable.paused ? ' · held' : ' · space to pause');
     messageCount = 0;
+    corruptCount = 0;
 }, 1000);
+
+// Global pause (spacebar): freezes the table, the signal view and the map so
+// they can be read. Reception and tracking continue; views catch up on resume.
+let paused = false;
+const pauseBadge = document.createElement('button');
+pauseBadge.className = 'pause-badge';
+pauseBadge.textContent = 'Paused · press space to resume';
+pauseBadge.hidden = true;
+pauseBadge.onclick = () => setPaused(false);
+mainSection.appendChild(pauseBadge);
+
+// Space (or releasing a lock) goes back to live mode.
+function setPaused(value) {
+    paused = value;
+    if (!paused) signalView.unlock();
+    pauseBadge.hidden = !paused;
+    messageTable.hold('pause', paused);
+    signalView.setPaused(paused);
+    if (!paused) aircraftMap?.update(tracker);
+}
+
+document.addEventListener('keydown', event => {
+    if (event.code !== 'Space' || event.repeat || !aircraftMap) return;
+    if (event.target.closest?.('input, textarea, select, [contenteditable]')) return;
+    event.preventDefault();
+    setPaused(!paused);
+});
 
 button.onclick = () => start();

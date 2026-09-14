@@ -12,6 +12,92 @@
 
 .app {
     display: none;
+    position: relative;
+    height: 100vh;
+}
+
+#map {
+    position: absolute;
+    inset: 0;
+}
+
+#canvas {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    width: min(360px, calc(100% - 80px));
+    max-height: 45vh;
+    display: flex;
+    flex-direction: column;
+    background: rgba(0, 0, 0, 0.6);
+    color: #fff;
+    border-radius: 6px;
+}
+
+#canvas p {
+    margin: 0;
+    padding: .5em 1em;
+}
+
+.altitude-legend {
+    background: rgba(0, 0, 0, 0.6);
+    color: #fff;
+    padding: 6px 8px;
+    border-radius: 4px;
+    width: 200px;
+    font-size: 11px;
+}
+
+.altitude-legend .bar {
+    height: 8px;
+    border-radius: 2px;
+}
+
+.altitude-legend .labels {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 2px;
+}
+
+.plane-labels {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    overflow: hidden;
+}
+
+.plane-label {
+    position: absolute;
+    top: 0;
+    left: 0;
+    color: #fff;
+    font-size: 12px;
+    line-height: 1.2;
+    white-space: nowrap;
+    text-shadow: 0 0 3px #000, 0 0 3px #000;
+    pointer-events: auto;
+    cursor: pointer;
+    will-change: transform;
+}
+
+.plane-label small {
+    font-weight: 400;
+    opacity: .85;
+}
+
+.tilt-toggle {
+    font-family: monospace;
+    font-weight: 800;
+    font-size: 11px;
+    border: none;
+    border-radius: 0;
+    padding: 0;
+}
+
+.maplibregl-popup-content {
+    font-family: monospace;
+    font-weight: 400;
+    line-height: 1.5;
 }
 
 body {
@@ -46,10 +132,85 @@ p {
 }
 
 .data {
-    font-size: 1.5em;
-    overflow-y: scroll;
-    height: 90vh;
-    padding: 1em;
+    font-size: .8em;
+    overflow-y: auto;
+    flex: 1;
+}
+
+.data:empty {
+    display: none;
+}
+
+.data div {
+    padding: .2em 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+    font-weight: 400;
+    word-break: break-word;
+}
+
+.data div.has-location {
+    cursor: crosshair;
+}
+
+.data div.hovered {
+    background: rgba(255, 255, 255, 0.15);
+}
+
+.data div.hovered:not(.has-location) {
+    opacity: .6;
+}
+
+.plane-highlight {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+    will-change: transform;
+}
+
+.plane-highlight::before,
+.plane-highlight::after {
+    content: "";
+    position: absolute;
+    left: -18px;
+    top: -18px;
+    width: 32px;
+    height: 32px;
+    border: 2px solid #fff;
+    border-radius: 50%;
+    box-shadow: 0 0 6px #000;
+}
+
+.plane-highlight::after {
+    animation: highlight-pulse 1s ease-out infinite;
+}
+
+.plane-highlight.offscreen::before {
+    border-style: dashed;
+}
+
+@keyframes highlight-pulse {
+    from { transform: scale(.6); opacity: 1; }
+    to { transform: scale(2); opacity: 0; }
+}
+
+.plane-highlight.flash::after {
+    animation-duration: .5s;
+}
+
+.plane-label.flashing,
+.plane-label.highlighted {
+    color: #ffe14d;
+    z-index: 1;
+}
+
+#canvas .rate {
+    font-size: .8em;
+    padding-bottom: 0;
+}
+
+.rate:empty {
+    display: none;
 }
 
 

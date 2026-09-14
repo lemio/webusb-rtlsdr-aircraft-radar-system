@@ -11,6 +11,7 @@
     <meta property="og:url" content="">
     <meta name="twitter:card" content="summary_large_image">
     <title>Aircraft radar system in JavaScript</title>
+    <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css">
     <link rel="stylesheet" href="styles.css">
 </head>
 
@@ -23,6 +24,7 @@
     </section>
 
     <main class="app">
+        <div id="map"></div>
         <div id="canvas">
             <p class="blink-me">Waiting for airplane...</p>
 
@@ -32,6 +34,7 @@
     <footer>Made by <a href="https://twitter.com/devdevcharlie">@devdevcharlie</a> | More info in <a
             href="https://charliegerard.dev/blog/aircraft-radar-system-rtl-sdr-web-usb">the blog
             post</a></footer>
+    <script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
     <script src="rtlsdr.js"></script>
     <script src="index.js" type="module"></script>
 </body>

@@ -57,13 +57,27 @@ function extractFields(mm) {
   return fields;
 }
 
+// [label, explanation, kind] for a checksum repair or failure, or null.
 function crcProblem(mm) {
-  if (!mm.crcOk) return ["CRC ✗", "Checksum does not match: message may be corrupt"];
-  if (mm.errorbit === -1) return null;
-  if (mm.errorbit > 255) {
-    return ["2 bit fix", `Checksum failed; repaired by flipping bits ${mm.errorbit & 0xff} and ${mm.errorbit >> 8}`];
+  if (!mm.crcOk) {
+    return ["CRC ✗", "Checksum does not match and no repair was found: the message is corrupt", "corrupt"];
   }
-  return ["1 bit fix", `Checksum failed; repaired by flipping bit ${mm.errorbit}`];
+  const fixed = mm.fixedBits;
+  if (!fixed?.length) return null;
+  const positions = fixed.map((b) => b + 1).join(", ");
+  if (mm.fixMethod === "sdd") {
+    return [
+      `SDD ${fixed.length}-bit`,
+      `SDD (soft-decision decoding): the checksum failed and no single-bit fix existed, so combinations of the least certain bits in the signal were tried. ` +
+        `Flipping bits ${positions} makes the checksum match. Hover the uncertainty lane in the signal view for details.`,
+      "sdd",
+    ];
+  }
+  return [
+    `${fixed.length}-bit CRC`,
+    `Checksum error control: the checksum pinpoints the wrong bit${fixed.length > 1 ? "s" : ""} (${positions})`,
+    "crc",
+  ];
 }
 
 // Number presentation (see "Beyond Excel, enter the Matrix"):
@@ -154,7 +168,9 @@ function messageContent(mm) {
 
   const problem = crcProblem(mm);
   if (problem) {
-    parts.push(field("crc", problem[0], link(problem[0], DOCS + "ads-b/8-error-control.html", problem[1])));
+    const note = link(problem[0], DOCS + "ads-b/8-error-control.html", problem[1]);
+    note.className = problem[2];
+    parts.push(field("crc", problem[0], note));
   }
   return parts;
 }

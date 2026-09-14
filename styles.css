@@ -243,6 +243,12 @@ p {
     color: #ff5c5c;
 }
 
+/* Repairs: amber; the label says how (CRC error control or SDD). */
+.messages .crc a.crc,
+.messages .crc a.sdd {
+    color: #e0a84a;
+}
+
 .messages tr.located {
     cursor: crosshair;
 }
@@ -401,6 +407,25 @@ p {
     font-weight: 600;
 }
 
+.signal-actions {
+    margin-left: auto;
+    display: flex;
+    gap: .5em;
+}
+
+.signal-button {
+    font: 400 11px system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: var(--ink);
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 3px;
+    padding: .15em .7em;
+}
+
+.signal-button:hover {
+    background: rgba(255, 255, 255, 0.14);
+}
+
 .signal-info,
 .signal-muted {
     color: var(--muted);
@@ -408,6 +433,10 @@ p {
 
 .signal-corrupt {
     color: #ff5c5c;
+}
+
+.signal-candidate {
+    color: #e0a84a;
 }
 
 .signal-body {

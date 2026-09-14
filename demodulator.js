@@ -91,6 +91,10 @@ Demodulator.prototype.detectMessage = function (mag, maglen, onMsg, onCorrupt) {
     const bits = new Uint8Array(long_msg_bits);
     const msg = new Uint8Array(long_msg_bits / 2);
     const aux = new Uint16Array(long_msg_bits * 2);
+    // Per bit: how clearly it was received, |first − second| / (first + second),
+    // scaled to 0–4096. Relative, so bits of a message whose strength varies
+    // are compared fairly (tested on real recordings; see tests/).
+    const confidence = new Uint16Array(long_msg_bits);
     let useCorrection = false;
 
     // The Mode S preamble is made of impulses of 0.5 microseconds at the
@@ -179,6 +183,7 @@ Demodulator.prototype.detectMessage = function (mag, maglen, onMsg, onCorrupt) {
             high = mag[j + i + PREAMBLE_US * 2 + 1];
             delta = low - high;
             if (delta < 0) delta = -delta;
+            confidence[i / 2] = Math.round((delta * 4096) / (low + high + 1));
 
             if (i > 0 && delta < 256) {
                 bits[i / 2] = bits[i / 2 - 1];
@@ -241,7 +246,7 @@ Demodulator.prototype.detectMessage = function (mag, maglen, onMsg, onCorrupt) {
         // may not be correct. This is handled by the next layer.
         if (errors === 0 || (this._aggressive && errors < 3)) {
             // Parse the received message
-            const mm = this._decoder.parse(msg, this._crcOnly);
+            const mm = this._decoder.parse(msg, this._crcOnly, confidence, useCorrection);
 
             // Where the message sits in this buffer, for visualising the signal
             // (in magnitude samples; the I/Q byte offset is twice this). The

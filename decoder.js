@@ -7,6 +7,22 @@ const ICAO_CACHE_LEN = 1024; // Power of two required
 const ICAO_CACHE_TTL = 60; // Time to live of cached addresses.
 const AIS_CHARSET =
   "?ABCDEFGHIJKLMNOPQRSTUVWXYZ????? ???????????????0123456789??????";
+// Soft-decision decoding (SDD): when the checksum fails, try flipping
+// combinations of the bits whose two halves were the closest in magnitude,
+// relative to their strength (the least certain). Defaults, overridable per
+// Decoder; chosen by replaying real recordings (tests/fixtures) with a
+// stress test for wrong repairs.
+export const SOFT_CANDIDATES = 20; // Least certain bits considered.
+export const SOFT_MAX_FLIPS = 5; // Largest combination tried.
+// Larger repairs are only accepted for an aircraft address seen recently in a
+// message with a clean checksum, since the chance that a random corrupt
+// message matches grows with the number of combinations tried.
+export const SOFT_UNGATED_FLIPS = 2;
+
+// DF11 all-call replies to a Mode S radar carry the radar's interrogator code
+// (II or SI) in the low 7 bits of the parity; only the other 17 must match.
+const PARITY_MASK_DF11 = 0xffff80;
+const PARITY_MASK = 0xffffff;
 export const UNIT_FEET = 0;
 export const UNIT_METERS = 1;
 
@@ -52,13 +68,21 @@ export function Decoder(opts) {
   if (!opts) opts = {};
   this._fixErrors = opts.fixErrors !== false; // single bit error correction if true
   this._aggressive = opts.aggressive || false; // aggressive detection algorithm
+  this._softCandidates = opts.softCandidates ?? SOFT_CANDIDATES;
+  this._softMaxFlips = opts.softMaxFlips ?? SOFT_MAX_FLIPS;
+  this._softUngatedFlips = opts.softUngatedFlips ?? SOFT_UNGATED_FLIPS;
 
   this._icaoCache = new Uint32Array(ICAO_CACHE_LEN * 2); // recently seen ICAO addresses cache
+  this._interrogatedAddresses = new Map(); // address → time of a first DF11 reply with an interrogator code
 }
 
 // Decode a raw Mode S message demodulated as a stream of bytes by
 // detect(), and split it into fields populating a Message object.
-Decoder.prototype.parse = function (msg, crcOnly) {
+// `confidence` (optional): per bit, how clearly it was received — the
+// magnitude difference between its two halves. Enables soft-decision repair.
+// `retry`: the same message is decoded again (e.g. after phase correction).
+Decoder.prototype.parse = function (msg, crcOnly, confidence, retry = false) {
+  if (!retry) this._lastInterrogated = null;
   const mm = new Message();
 
   mm.msg = msg;
@@ -74,21 +98,62 @@ Decoder.prototype.parse = function (msg, crcOnly) {
   // Check CRC and fix single bit errors using the CRC when possible (DF 11 and 17).
   mm.crcOk = mm.crc === crc;
 
+  const df11 = mm.msgtype === 11;
+  const parityMask = df11 ? PARITY_MASK_DF11 : PARITY_MASK;
+  // A non-zero code also matches by chance (1 in ~130,000 corrupt replies), so
+  // it's only accepted from an aircraft already seen, or once the same address
+  // has arrived this way twice (a chance match won't repeat).
+  if (!mm.crcOk && df11 && ((mm.crc ^ crc) & parityMask) === 0 &&
+    (this._icaoAddrWasRecentlySeen(addressOf(msg)) || this._confirmInterrogatedAddress(addressOf(msg), retry))) {
+    mm.crcOk = true;
+    mm.interrogatorCode = mm.crc ^ crc;
+  }
+
   if (
     !mm.crcOk &&
     this._fixErrors &&
     (mm.msgtype === 11 || mm.msgtype === 17)
   ) {
-    if ((mm.errorbit = fixSingleBitErrors(msg, mm.msgbits)) !== -1) {
+    // Ignoring the interrogator code makes a DF11 repair match more easily,
+    // so DF11 repairs must give the address of a recently seen aircraft.
+    const isKnownAddress = (addr) => this._icaoAddrWasRecentlySeen(addr);
+    const acceptSingle = df11 ? () => isKnownAddress(addressOf(msg)) : () => true;
+    let fixed;
+    if ((mm.errorbit = fixSingleBitError(msg, mm.msgbits, parityMask, acceptSingle)) !== -1) {
+      // A single wrong bit can always be located from the checksum alone:
+      // every bit position has its own checksum effect.
+      mm.fixMethod = "crc";
+      mm.fixedBits = [mm.errorbit];
       mm.crc = checksum(msg, mm.msgbits);
       mm.crcOk = true;
-    } else if (
+    } else if (confidence) {
+      // More bits need the signal: soft-decision decoding (SDD) only tries the
+      // least certain bits. Keep what it looked at, for visualisation.
+      mm.bitCertainty = Array.from(confidence.subarray(0, mm.msgbits));
+      mm.sddCandidates = leastCertainBits(mm.msgbits, confidence, this._softCandidates);
+      fixed = fixSoftErrors(msg, mm.msgbits, mm.sddCandidates, confidence, this._softMaxFlips,
+        isKnownAddress, parityMask, df11, this._softUngatedFlips);
+      if (fixed) {
+        mm.fixMethod = "sdd";
+        mm.fixedBits = fixed;
+        mm.errorbit = fixed[0];
+        mm.crc = checksum(msg, mm.msgbits);
+        mm.crcOk = true;
+      }
+    }
+    if (
+      !mm.crcOk &&
       this._aggressive &&
       mm.msgtype === 17 &&
       (mm.errorbit = fixTwoBitsErrors(msg, mm.msgbits)) !== -1
     ) {
+      mm.fixMethod = "crc2";
+      mm.fixedBits = [mm.errorbit & 0xff, mm.errorbit >> 8];
       mm.crc = checksum(msg, mm.msgbits);
       mm.crcOk = true;
+    }
+    if (mm.crcOk && df11) {
+      mm.interrogatorCode = checksum(msg, mm.msgbits) ^ msgcrc(msg, mm.msgbits);
     }
   }
 
@@ -152,7 +217,8 @@ Decoder.prototype.parse = function (msg, crcOnly) {
   } else {
     // If this is DF 11 or DF 17 and the checksum was ok, we can add this
     // address to the list of recently seen addresses.
-    if (mm.crcOk && mm.errorbit === -1) {
+    // Only clean, unrepaired checksums make an address known.
+    if (mm.crcOk && mm.errorbit === -1 && !mm.interrogatorCode) {
       this._addRecentlySeenIcaoAddr(mm.icao);
     }
   }
@@ -295,6 +361,25 @@ Decoder.prototype._bruteForceAp = function (msg, mm) {
   return false;
 };
 
+// Whether a DF11 reply with an interrogator code from `addr` arrived before
+// (within ICAO_CACHE_TTL). The second one confirms the address, which then
+// counts as recently seen. The first one is only remembered.
+Decoder.prototype._confirmInterrogatedAddress = function (addr, retry) {
+  // A retry of the message that was just remembered is not a second reply.
+  if (retry && addr === this._lastInterrogated) return false;
+  const now = (Date.now() / 1000) >> 0;
+  const first = this._interrogatedAddresses.get(addr);
+  if (first !== undefined && now - first <= ICAO_CACHE_TTL) {
+    this._interrogatedAddresses.delete(addr);
+    this._addRecentlySeenIcaoAddr(addr);
+    return true;
+  }
+  if (this._interrogatedAddresses.size > 4096) this._interrogatedAddresses.clear(); // Mostly chance matches.
+  this._interrogatedAddresses.set(addr, now);
+  this._lastInterrogated = addr;
+  return false;
+};
+
 // Returns 1 if the specified ICAO address was seen in a DF format with proper
 // checksum (not xored with address) no more than * ICAO_CACHE_TTL
 // seconds ago. Otherwise returns 0.
@@ -326,6 +411,11 @@ function Message() {
   this.crcOk = false; // True if CRC was valid
   this.crc = null; // Message CRC
   this.errorbit = -1; // Bit corrected. -1 if no bit corrected.
+  this.fixedBits = null; // All corrected bit positions (0-based), if any.
+  this.fixMethod = null; // "crc" (single bit), "sdd" (soft decision) or "crc2" (brute-force two bits).
+  this.bitCertainty = null; // Per bit |first half − second half|, when SDD was attempted.
+  this.sddCandidates = null; // The least certain bits SDD tried, when attempted.
+  this.interrogatorCode = 0; // DF11: the radar's interrogator code found in the parity.
   this.icao = 0; // ICAO address in decimal form
   this.phaseCorrected = false; // True if phase correction was applied.
 
@@ -430,7 +520,73 @@ function icaoCacheHasAddr(a) {
   return a & (ICAO_CACHE_LEN - 1);
 }
 
-// Similar to fixSingleBitErrors() but try every possible two bit
+// The bits SDD may flip: the least certain ones, excluding the downlink
+// format (it determines the message length).
+function leastCertainBits(bits, confidence, count) {
+  const candidates = [];
+  for (let j = 5; j < bits; j++) candidates.push(j);
+  candidates.sort((a, b) => confidence[a] - confidence[b]);
+  candidates.length = Math.min(count, candidates.length);
+  return candidates;
+}
+
+// Soft-decision repair of multi-bit errors. Each bit's effect on the checksum
+// is fixed (the CRC is linear), so a combination of flips repairs the message
+// when the XOR of their effects equals the current mismatch.
+//
+// Combinations are tried from small to large, so the smallest explanation
+// wins; among equally small ones, the one made of the least certain bits.
+// Repairs larger than SOFT_UNGATED_FLIPS must be unambiguous and give the
+// address of an aircraft recently seen with a clean checksum
+// (`isKnownAddress`), since false matches become likely with that many
+// combinations. Returns the flipped bit positions (fixing `msg` in place), or
+// null.
+function fixSoftErrors(msg, bits, candidates, confidence, maxFlips, isKnownAddress,
+  parityMask = PARITY_MASK, alwaysGate = false, ungatedFlips = SOFT_UNGATED_FLIPS) {
+  const mismatch = (checksum(msg, bits) ^ msgcrc(msg, bits)) & parityMask;
+  const effect = candidates.map((j) => bitEffect(j, bits) & parityMask);
+  const n = candidates.length;
+
+  for (let size = 2; size <= Math.min(maxFlips, n); size++) {
+    const matches = [];
+    const chosen = [];
+    const search = (from, acc) => {
+      for (let k = from; k <= n - (size - chosen.length); k++) {
+        chosen.push(k);
+        const x = acc ^ effect[k];
+        if (chosen.length === size) {
+          if (x === mismatch) matches.push(chosen.map((i) => candidates[i]));
+        } else {
+          search(k + 1, x);
+        }
+        chosen.pop();
+      }
+    };
+    search(0, 0);
+    if (!matches.length) continue;
+
+    const cost = (positions) => positions.reduce((sum, j) => sum + confidence[j], 0);
+    matches.sort((a, b) => cost(a) - cost(b));
+    const best = matches[0];
+
+    if (alwaysGate || size > ungatedFlips) {
+      if (matches.length > 1) return null; // Ambiguous.
+      const repaired = msg.slice(0, 4);
+      for (const j of best) if (j < 32) repaired[j >> 3] ^= 1 << (7 - (j % 8));
+      const addr = (repaired[1] << 16) | (repaired[2] << 8) | repaired[3];
+      if (!isKnownAddress(addr)) return null;
+    }
+    return flipBits(msg, best);
+  }
+  return null;
+}
+
+function flipBits(msg, positions) {
+  for (const j of positions) msg[j >> 3] ^= 1 << (7 - (j % 8));
+  return positions.sort((a, b) => a - b);
+}
+
+// Similar to fixSingleBitError() but try every possible two bit
 // combination. This is very slow and should be tried only against DF17
 // messages that don't pass the checksum, and only in Aggressive Mode.
 function fixTwoBitsErrors(msg, bits) {
@@ -471,32 +627,29 @@ function fixTwoBitsErrors(msg, bits) {
   return -1;
 }
 
-// Try to fix single bit errors using the checksum. On success modifies the
-// original buffer with the fixed version, and returns the position of the
-// error bit. Otherwise if fixing failed -1 is returned.
-function fixSingleBitErrors(msg, bits) {
-  const aux = new Uint8Array(LONG_MSG_BYTES);
+// How flipping bit `j` changes the checksum mismatch: a data bit changes the
+// computed checksum, a parity bit the received one.
+function bitEffect(j, bits) {
+  const offset = bits === 112 ? 0 : 112 - 56;
+  return j < bits - 24 ? CHECKSUM_TABLE[j + offset] : 1 << (bits - 1 - j);
+}
 
+function addressOf(msg) {
+  return (msg[1] << 16) | (msg[2] << 8) | msg[3];
+}
+
+// Fix a single bit error using the checksum: each bit position has a unique
+// effect, so the mismatch points at the bit (within `parityMask`). On success
+// (and if `accept` agrees) fixes `msg` in place and returns the bit position;
+// otherwise returns -1.
+function fixSingleBitError(msg, bits, parityMask, accept) {
+  const mismatch = (checksum(msg, bits) ^ msgcrc(msg, bits)) & parityMask;
   for (let j = 0; j < bits; j++) {
-    const byte = (j / 8) >> 0; // Ignore remainder
-    const bitmask = 1 << (7 - (j % 8));
-
-    memcpy(aux, 0, msg, 0, bits / 8);
-    aux[byte] ^= bitmask; // Flip j-th bit.
-
-    const crc1 =
-      (aux[bits / 8 - 3] << 16) | (aux[bits / 8 - 2] << 8) | aux[bits / 8 - 1];
-    const crc2 = checksum(aux, bits);
-
-    if (crc1 === crc2) {
-      // The error is fixed. Overwrite the original buffer with the
-      // corrected sequence, and returns the error bit position.
-      memcpy(msg, 0, aux, 0, bits / 8);
-
-      return j;
-    }
+    if ((bitEffect(j, bits) & parityMask) !== mismatch) continue;
+    msg[j >> 3] ^= 1 << (7 - (j % 8));
+    if (accept()) return j;
+    msg[j >> 3] ^= 1 << (7 - (j % 8)); // Not plausible: undo.
   }
-
   return -1;
 }
 

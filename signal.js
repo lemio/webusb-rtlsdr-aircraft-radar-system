@@ -15,6 +15,7 @@
 // freezes while the pointer is over it.
 
 import { describeType } from "./messages.js";
+import { SOFT_CANDIDATES, SOFT_MAX_FLIPS, SOFT_UNGATED_FLIPS } from "./decoder.js";
 
 const SAMPLE_RATE = 2_000_000; // Samples per second (0.5 µs per sample).
 const PREAMBLE_SAMPLES = 16; // 8 µs.
@@ -23,6 +24,50 @@ const CONTEXT_SAMPLES = 16; // Shown before and after a message.
 const PX_PER_SAMPLE = 4; // Fixed scale: one bit is 8 px, one byte 64 px.
 const DETAIL_SAMPLES = CONTEXT_SAMPLES * 2 + PREAMBLE_SAMPLES + 112 * 2; // Fits a long message.
 const MAX_BUFFERS = 32; // Recent buffers kept for the overview (~2 s).
+const MAX_HISTORY = 2000; // Recent message snippets kept for export (~1 MB).
+const CENTER_FREQUENCY = 1_090_000_000;
+
+const SDD_EXPLANATION =
+  "<b>SDD · soft-decision decoding</b><br>" +
+  "Each bit is decided by comparing its two halves; the closer they are relative to their strength, the less certain the bit (a taller bar here).<br>" +
+  "When the checksum fails and no single-bit CRC fix exists, SDD tries flipping combinations of the " +
+  `${SOFT_CANDIDATES} least certain bits (<span class="signal-candidate">amber</span>), up to ${SOFT_MAX_FLIPS} at once, ` +
+  'and keeps the smallest combination that makes the checksum match (<span class="signal-corrupt">red</span>).<br>' +
+  `Repairs of more than ${SOFT_UNGATED_FLIPS} bits are only accepted when they are unambiguous and give the address of an aircraft recently received with a clean checksum.`;
+
+function toBase64(bytes) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
+// What the decoder made of a message, for exported files.
+function describeDecoded(mm) {
+  return {
+    df: mm.msgtype,
+    icao: mm.icao.toString(16).padStart(6, "0"),
+    bits: mm.msg.length * 8,
+    hex: [...mm.msg].map((b) => b.toString(16).padStart(2, "0")).join(""),
+    crcOk: mm.crcOk,
+    fixMethod: mm.fixMethod ?? null,
+    fixedBits: mm.fixedBits ?? null,
+    sddCandidates: mm.sddCandidates ?? null,
+    bitCertainty: mm.bitCertainty ?? null,
+  };
+}
+
+function download(name, object) {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(object)], { type: "application/json" }));
+  const a = Object.assign(document.createElement("a"), { href: url, download: name });
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+const timestamp = () => new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
 const CPR_MAX = 131072;
 const CHARSET = "?ABCDEFGHIJKLMNOPQRSTUVWXYZ????? ???????????????0123456789??????";
 
@@ -33,8 +78,10 @@ const LANES = {
   fields: [28, 16],
   magnitude: [48, 104],
   iq: [158, 56],
+  uncertainty: [220, 34],
 };
-const DETAIL_HEIGHT = 216;
+const DETAIL_HEIGHT = 256;
+const LEGEND_WIDTH = 110; // Room right of the message for lane legends.
 
 const COLORS = {
   ink: "#e8e8e8",
@@ -46,9 +93,12 @@ const COLORS = {
   highlight: "#ffe14d",
   highlightBand: "rgba(255, 225, 77, 0.13)",
   corrupt: "#ff5c5c",
+  candidate: "#e0a84a",
   i: "#6ab0ff",
   q: "#ffb35c",
 };
+
+const ordinal = (n) => n + (n % 10 === 1 && n !== 11 ? "st" : n % 10 === 2 && n !== 12 ? "nd" : n % 10 === 3 && n !== 13 ? "rd" : "th");
 
 const hexOf = (mm) => mm.icao.toString(16).padStart(6, "0");
 
@@ -65,10 +115,13 @@ function bitString(mm, from, to) {
 const uint = (mm, from, to) => parseInt(bitString(mm, from, to), 2);
 
 function parityText(mm) {
-  if (!mm.crcOk) return "does not match the message: corrupt, and single/double bit repair failed";
-  if (mm.errorbit === -1) return "matches the message";
-  if (mm.errorbit > 255) return `matched after flipping bits ${mm.errorbit & 0xff} and ${mm.errorbit >> 8}`;
-  return `matched after flipping bit ${mm.errorbit}`;
+  if (!mm.crcOk) return "does not match: corrupt (no single-bit CRC fix, and SDD found no repair among the least certain bits)";
+  const fixed = mm.fixedBits;
+  const code = mm.interrogatorCode ? ` with interrogator code ${mm.interrogatorCode} (the radar that asked is encoded in the low 7 bits)` : "";
+  if (!fixed?.length) return `matches the message${code}`;
+  const positions = fixed.map((b) => b + 1).join(", ");
+  if (mm.fixMethod === "sdd") return `matched${code} after soft-decision decoding flipped bits ${positions} (see the uncertainty lane)`;
+  return `matched${code} after the checksum pinpointed bit${fixed.length > 1 ? "s" : ""} ${positions}`;
 }
 
 // The parts of a message: bit ranges (0-based, end exclusive), what they
@@ -212,6 +265,10 @@ export class SignalView {
       <div class="signal-header">
         <span class="signal-title">I/Q signal</span>
         <span class="signal-info"></span>
+        <span class="signal-actions">
+          <button class="signal-button" data-export="messages" title="Download the samples around the most recent messages (valid, repaired and corrupt) with what the decoder made of them, as JSON for tests">Export messages</button>
+          <button class="signal-button" data-export="buffer" title="Download the whole buffer shown in the overview (64 ms of raw I/Q) with its messages, as JSON">Export buffer</button>
+        </span>
       </div>
       <div class="signal-body">
         <div class="signal-plots">
@@ -224,12 +281,19 @@ export class SignalView {
       <div class="signal-tooltip" hidden></div>`;
     this._container = container;
     this._info = container.querySelector(".signal-info");
+    this._history = []; // Recent { mm, snapshot }, for export.
+    this._sequence = 0; // Buffer counter.
+    container.querySelector(".signal-actions").addEventListener("click", (event) => {
+      const kind = event.target.closest("[data-export]")?.dataset.export;
+      if (kind === "messages") this.exportMessages();
+      if (kind === "buffer") this.exportBuffer();
+    });
     this._overview = container.querySelector(".signal-overview");
     this._detailTitle = container.querySelector(".signal-detail-title");
     this._detail = container.querySelector(".signal-detail");
     this._constellation = container.querySelector(".signal-constellation");
     this._tooltip = container.querySelector(".signal-tooltip");
-    this._detail.style.width = `${DETAIL_SAMPLES * PX_PER_SAMPLE}px`;
+    this._detail.style.width = `${DETAIL_SAMPLES * PX_PER_SAMPLE + LEGEND_WIDTH}px`;
     this._detail.style.height = `${DETAIL_HEIGHT}px`;
 
     container.addEventListener("mouseenter", () => {
@@ -271,14 +335,17 @@ export class SignalView {
   // Feed one buffer of interleaved unsigned 8-bit I/Q samples and the
   // messages found in it (valid and corrupt).
   push(data, messages) {
-    const buffer = { data, messages };
+    const buffer = { data, messages, sequence: this._sequence++, receivedAt: new Date() };
     // Keep each message's own samples (small), so it can be shown later, e.g.
     // when its row in the table is hovered — even while the view is paused.
     for (const mm of messages) {
       const start = Math.max(0, mm.sampleOffset - CONTEXT_SAMPLES);
       const end = Math.min(data.length / 2, start + DETAIL_SAMPLES);
-      this._snapshots.set(mm, { start, samples: data.slice(start * 2, end * 2), buffer });
+      const snapshot = { start, samples: data.slice(start * 2, end * 2), buffer };
+      this._snapshots.set(mm, snapshot);
+      this._history.push({ mm, snapshot });
     }
+    if (this._history.length > MAX_HISTORY) this._history.splice(0, this._history.length - MAX_HISTORY);
     this._buffers.push(buffer);
     if (this._buffers.length > MAX_BUFFERS) this._buffers.shift();
 
@@ -288,6 +355,48 @@ export class SignalView {
     const latest = messages.findLast((mm) => mm.crcOk) ?? messages[messages.length - 1];
     if (latest) this._select(latest);
     this._scheduleRender();
+  }
+
+  // --- Export ---------------------------------------------------------------
+
+  // Samples around recent messages, oldest first. Replaying a snippet through
+  // the demodulator reproduces the message (see tests/).
+  exportMessages() {
+    download(`adsb-iq-messages-${timestamp()}.json`, {
+      format: "webusb-rtlsdr-adsb/iq-messages",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      sampleRate: SAMPLE_RATE,
+      centerFrequency: CENTER_FREQUENCY,
+      sampleFormat: "uint8, interleaved I/Q, zero level 127.5; base64",
+      decoder: { softCandidates: SOFT_CANDIDATES, softMaxFlips: SOFT_MAX_FLIPS, softUngatedFlips: SOFT_UNGATED_FLIPS },
+      messages: this._history.map(({ mm, snapshot }) => ({
+        receivedAt: snapshot.buffer.receivedAt.toISOString(),
+        buffer: snapshot.buffer.sequence,
+        sampleOffset: mm.sampleOffset, // Message start within its buffer.
+        snippetStart: snapshot.start, // Snippet start within its buffer.
+        samples: toBase64(snapshot.samples),
+        decoded: describeDecoded(mm),
+      })),
+    });
+  }
+
+  // The buffer shown in the overview, whole.
+  exportBuffer() {
+    const buffer = this._chunk;
+    if (!buffer) return;
+    download(`adsb-iq-buffer-${timestamp()}.json`, {
+      format: "webusb-rtlsdr-adsb/iq-buffer",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      receivedAt: buffer.receivedAt.toISOString(),
+      sampleRate: SAMPLE_RATE,
+      centerFrequency: CENTER_FREQUENCY,
+      sampleFormat: "uint8, interleaved I/Q, zero level 127.5; base64",
+      decoder: { softCandidates: SOFT_CANDIDATES, softMaxFlips: SOFT_MAX_FLIPS, softUngatedFlips: SOFT_UNGATED_FLIPS },
+      samples: toBase64(buffer.data),
+      messages: buffer.messages.map((mm) => ({ sampleOffset: mm.sampleOffset, decoded: describeDecoded(mm) })),
+    });
   }
 
   // Show a message (e.g. hovered in the table) until called with null.
@@ -400,6 +509,12 @@ export class SignalView {
     const dataStart = messageStart + PREAMBLE_SAMPLES;
     const bitCount = selected.mm.msg.length * 8;
 
+    // The uncertainty lane's label and legend explain SDD.
+    const lastBitX = (dataStart + bitCount * 2) * PX_PER_SAMPLE;
+    if (y >= LANES.uncertainty[0] && (x < dataStart * PX_PER_SAMPLE || x >= lastBitX)) {
+      this._setDetailHover({ kind: "sdd", from: -1, to: -1, fields: [] }, event);
+      return;
+    }
     if (sample >= messageStart && sample < dataStart) {
       this._setDetailHover({ kind: "preamble", from: -8, to: 0, fields: [] }, event);
       return;
@@ -438,7 +553,9 @@ export class SignalView {
     }
     const { mm, samples } = this._selected;
     const lines = [];
-    if (hover.kind === "preamble") {
+    if (hover.kind === "sdd") {
+      lines.push(SDD_EXPLANATION);
+    } else if (hover.kind === "preamble") {
       lines.push("<b>Preamble</b> · 8 µs",
         "Pulses at 0, 1, 3.5 and 4.5 µs (the marked samples) announce a message.",
         "The bits follow; each bit is 1 µs = 2 samples.");
@@ -455,7 +572,19 @@ export class SignalView {
         // How this bit was decided from its two samples (pulse position).
         const first = this._magnitudeAt(samples, mm.sampleOffset - this._selected.start + PREAMBLE_SAMPLES + hover.bit * 2);
         const second = this._magnitudeAt(samples, mm.sampleOffset - this._selected.start + PREAMBLE_SAMPLES + hover.bit * 2 + 1);
-        lines.push(`<span class="signal-muted">Bit ${hover.bit + 1}: first half ${first.toFixed(0)} ${first > second ? ">" : "<"} second half ${second.toFixed(0)} → ${bitAt(mm, hover.bit)}</span>`);
+        const flipped = mm.fixedBits?.includes(hover.bit);
+        const received = flipped ? 1 - bitAt(mm, hover.bit) : bitAt(mm, hover.bit);
+        lines.push(`<span class="signal-muted">Bit ${hover.bit + 1}: first half ${first.toFixed(0)} ${first > second ? ">" : "<"} second half ${second.toFixed(0)} → ${received}` +
+          ` · certainty ${Math.round((Math.abs(first - second) / (first + second || 1)) * 100)} %</span>`);
+        const candidateRank = mm.sddCandidates?.indexOf(hover.bit) ?? -1;
+        if (candidateRank >= 0) {
+          lines.push(`<span class="signal-candidate">SDD candidate: the ${ordinal(candidateRank + 1)} least certain bit</span>`);
+        }
+        if (flipped && mm.fixMethod === "sdd") {
+          lines.push(`<span class="signal-corrupt">Flipped to ${bitAt(mm, hover.bit)} by soft-decision decoding: flipping this combination of uncertain bits makes the checksum match.</span>`);
+        } else if (flipped) {
+          lines.push(`<span class="signal-corrupt">Flipped to ${bitAt(mm, hover.bit)} by checksum error control: the checksum mismatch points at exactly this bit.</span>`);
+        }
       }
     }
     this._tooltip.innerHTML = lines.join("<br>");
@@ -606,6 +735,8 @@ export class SignalView {
     ctx.fillText("I", 0, LANES.iq[0]);
     ctx.fillStyle = COLORS.q;
     ctx.fillText("Q", 8, LANES.iq[0]);
+    ctx.fillStyle = COLORS.faint;
+    ctx.fillText("uncertainty", 0, LANES.uncertainty[0] + 2);
 
     // Hovered range as a band through all lanes.
     if (hover) {
@@ -628,12 +759,17 @@ export class SignalView {
     }
     ctx.font = "10px system-ui, -apple-system, 'Segoe UI', sans-serif";
 
-    // Bits: a filled cell for 1, a baseline for 0.
+    // Bits: a filled cell for 1, a baseline for 0. Bits flipped by error
+    // correction are red, with a red mark over their two samples below.
+    const fixed = new Set(mm.fixedBits ?? []);
     for (let b = 0; b < bitCount; b++) {
       const bit = bitAt(mm, b);
-      ctx.fillStyle = inHover(b) ? COLORS.highlight : bit ? COLORS.ink : COLORS.faint;
+      ctx.fillStyle = fixed.has(b) ? COLORS.corrupt : inHover(b) ? COLORS.highlight : bit ? COLORS.ink : COLORS.faint;
       const [top, height] = LANES.bits;
       ctx.fillRect(bitX(b) + 1, bit ? top : top + height - 1, 2 * px - 2, bit ? height : 1);
+      if (fixed.has(b)) {
+        ctx.fillRect(bitX(b) + 1, LANES.magnitude[0] + LANES.magnitude[1] + 1, 2 * px - 2, 2);
+      }
     }
 
     // Fields: a bracket per field with its name when it fits.
@@ -713,6 +849,41 @@ export class SignalView {
       }
       ctx.stroke();
     }
+
+    this._renderUncertainty(ctx, bitX, inHover);
+  }
+
+  // Per bit uncertainty, when soft-decision decoding was attempted: taller bars
+  // are less certain (the two halves were closer). SDD's candidates are amber,
+  // the bits it flipped red.
+  _renderUncertainty(ctx, bitX, inHover) {
+    const { mm } = this._selected;
+    const [top, height] = LANES.uncertainty;
+    const certainty = mm.bitCertainty;
+    if (!certainty) {
+      ctx.fillStyle = COLORS.faint;
+      ctx.fillText(mm.fixMethod === "crc" ? "SDD not needed: fixed by the checksum alone" : "shown when SDD (soft-decision decoding) is used",
+        bitX(0), top + 2);
+      return;
+    }
+    const max = Math.max(1, ...certainty);
+    const candidates = new Set(mm.sddCandidates ?? []);
+    const fixed = new Set(mm.fixedBits ?? []);
+    for (let b = 0; b < certainty.length; b++) {
+      const h = Math.max(1, (1 - certainty[b] / max) * height);
+      ctx.fillStyle = fixed.has(b) ? COLORS.corrupt
+        : inHover(b) ? COLORS.highlight
+        : candidates.has(b) ? COLORS.candidate
+        : COLORS.faint;
+      ctx.fillRect(bitX(b) + 1, top + height - h, 2 * PX_PER_SAMPLE - 2, h);
+    }
+    ctx.fillStyle = COLORS.rule;
+    ctx.fillRect(bitX(0), top + height, bitX(certainty.length) - bitX(0), 1);
+    const legendX = bitX(certainty.length) + 8;
+    ctx.fillStyle = COLORS.candidate;
+    ctx.fillText(`${candidates.size} SDD candidates`, legendX, top + 2);
+    ctx.fillStyle = mm.fixMethod === "sdd" ? COLORS.corrupt : COLORS.muted;
+    ctx.fillText(mm.fixMethod === "sdd" ? `${fixed.size} flipped` : "no fix found", legendX, top + 14);
   }
 
   _renderConstellation() {

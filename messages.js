@@ -302,6 +302,21 @@ export class MessageTable {
     this.highlightValues(pairs);
   }
 
+  // Remove all rows and anything queued.
+  reset() {
+    this._pending = [];
+    this._body.replaceChildren();
+    this._container.hidden = true;
+    this._last = null;
+    this._hoveredRow = null;
+    this._hoveredCell = null;
+    this._focusedRow = null;
+    this._shownRow = null;
+    this._shown = null;
+    this._follow = true;
+    this.highlightValues([]);
+  }
+
   // Mark the row of the message shown in the signal view (and whether it's locked).
   markShown(mm, locked) {
     this._shown = { mm, locked }; // Also applied to its row if that's created later.

@@ -459,6 +459,19 @@ export class AircraftMap {
     this.map.triggerRepaint();
   }
 
+  // Remove every aircraft, trail, label, highlight and popup. The view stays.
+  async reset(tracker) {
+    for (const flash of this._flashes.values()) {
+      clearTimeout(flash.timer);
+      flash.el.remove();
+    }
+    this._flashes.clear();
+    this.highlight(null);
+    this._popup?.remove();
+    this._popupHex = null;
+    await this.update(tracker);
+  }
+
   async update(tracker) {
     await this._ready;
     this._tracker = tracker;

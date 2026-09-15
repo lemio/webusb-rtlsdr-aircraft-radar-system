@@ -48,6 +48,10 @@ export function Demodulator(opts) {
 
 // `onCorrupt` (optional) receives messages whose checksum still fails after
 // error correction and a retry with phase correction.
+Demodulator.prototype.reset = function () {
+    this._decoder.reset();
+};
+
 Demodulator.prototype.process = function (data, size, onMsg, onCorrupt) {
     // If no pre-initialized magnitute array have been given upon initialization,
     // initialize one the first time `process` is called with the expectation

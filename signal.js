@@ -381,6 +381,23 @@ export class SignalView {
 
   // Samples around recent messages, oldest first. Replaying a snippet through
   // the demodulator reproduces the message (see tests/).
+  // Forget all buffers, messages, locks and the export history.
+  reset() {
+    this._locked = null;
+    this._pinned = null;
+    this._chunk = null;
+    this._selected = null;
+    this._hover = null;
+    this._hoveredMessage = null;
+    this._buffers = [];
+    this._history = [];
+    this._snapshots = new WeakMap();
+    this._tooltip.hidden = true;
+    this._info.textContent = "";
+    this._renderTitle();
+    this._scheduleRender();
+  }
+
   setDetector(detector) {
     this._detectorSelect.value = detector;
   }

@@ -191,6 +191,16 @@ export class AircraftTracker {
     }
   }
 
+  // Forget every aircraft, including the saved history.
+  reset() {
+    this.aircraft.clear();
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch (error) {
+      console.warn("Could not clear aircraft history", error);
+    }
+  }
+
   _load() {
     try {
       const stored = JSON.parse(localStorage.getItem(STORAGE_KEY));

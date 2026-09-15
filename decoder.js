@@ -361,6 +361,12 @@ Decoder.prototype._bruteForceAp = function (msg, mm) {
   return false;
 };
 
+// Forget which aircraft were seen (used to accept radar replies and larger repairs).
+Decoder.prototype.reset = function () {
+  this._icaoCache.fill(0);
+  this._interrogatedAddresses.clear();
+};
+
 // Whether a DF11 reply with an interrogator code from `addr` arrived before
 // (within ICAO_CACHE_TTL). The second one confirms the address, which then
 // counts as recently seen. The first one is only remembered.

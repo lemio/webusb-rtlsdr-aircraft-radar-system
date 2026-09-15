@@ -310,6 +310,29 @@ p {
     z-index: 1;
 }
 
+.status-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1em;
+    padding-right: .75em;
+}
+
+.reset-button {
+    font: 400 11px system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: #e8e8e8;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 3px;
+    padding: .15em .7em;
+    margin-top: .6em;
+}
+
+.reset-button:hover {
+    background: rgba(255, 92, 92, 0.18);
+    border-color: rgba(255, 92, 92, 0.6);
+}
+
 #canvas .rate {
     font: 400 11px system-ui, -apple-system, "Segoe UI", sans-serif;
     font-variant-numeric: tabular-nums;

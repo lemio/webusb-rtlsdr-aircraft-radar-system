@@ -147,9 +147,17 @@ const signalView = new SignalView(document.querySelector('#signal'), {
 signalView.setDetector(demodulator.detector);
 
 // Message rate, so it's clear how fast data is really coming in.
+const statusBar = document.createElement('div');
+statusBar.className = 'status-bar';
 const rateElement = document.createElement('p');
 rateElement.className = 'rate';
-document.querySelector('.data').before(rateElement);
+const resetButton = document.createElement('button');
+resetButton.className = 'reset-button';
+resetButton.textContent = 'Reset';
+resetButton.title = 'Clear all aircraft, trails, saved history, messages and signals';
+resetButton.onclick = () => reset();
+statusBar.append(rateElement, resetButton);
+document.querySelector('.data').before(statusBar);
 setInterval(() => {
     rateElement.textContent = `${messageCount} msg/s` +
         (corruptCount ? ` · ${corruptCount} corrupt` : '') +
@@ -157,6 +165,21 @@ setInterval(() => {
     messageCount = 0;
     corruptCount = 0;
 }, 1000);
+
+// Reset: start over with an empty map, table and signal view. Reception keeps
+// running, settings (like the detector) are kept.
+function reset() {
+    if (!confirm('Clear all aircraft, trails, saved history, messages and signals?')) return;
+    setPaused(false);
+    tracker.reset();
+    demodulator.reset();
+    messageTable.reset();
+    signalView.reset();
+    aircraftMap?.reset(tracker);
+    messageCount = 0;
+    corruptCount = 0;
+    resetButton.blur(); // So the spacebar pauses instead of pressing it again.
+}
 
 // Global pause (spacebar): freezes the table, the signal view and the map so
 // they can be read. Reception and tracking continue; views catch up on resume.

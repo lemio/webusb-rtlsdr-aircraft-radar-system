@@ -166,13 +166,17 @@ function messageContent(mm) {
     parts.push(field("squawk", f.squawk, unit("squawk"), figure(f.squawk, 4)));
   }
 
-  const problem = crcProblem(mm);
-  if (problem) {
-    const note = link(problem[0], DOCS + "ads-b/8-error-control.html", problem[1]);
-    note.className = problem[2];
-    parts.push(field("crc", problem[0], note));
-  }
   return parts;
+}
+
+// The checksum column: empty when the checksum matched, otherwise how it was
+// repaired (amber) or that it failed (red).
+function checksumContent(mm) {
+  const problem = crcProblem(mm);
+  if (!problem) return null;
+  const note = link(problem[0], DOCS + "ads-b/8-error-control.html", problem[1]);
+  note.className = problem[2];
+  return field("crc", problem[0], note);
 }
 
 // `column` and `value` let hovering highlight every cell with the same value.
@@ -226,6 +230,7 @@ export class MessageTable {
         <th>icao</th>
         <th>type</th>
         <th>message</th>
+        <th title="Checksum: empty when it matched; otherwise how the message was repaired, or that it is corrupt">crc</th>
       </tr></thead>
       <tbody></tbody>`;
     this._body = this.table.tBodies[0];
@@ -422,6 +427,7 @@ export class MessageTable {
     cell(row, "type", "type", type, `${mm.msgtype} ${abbreviation}`);
 
     cell(row, "message", "message", messageContent(mm));
+    cell(row, "crc", "crc", checksumContent(mm));
 
     return row;
   }

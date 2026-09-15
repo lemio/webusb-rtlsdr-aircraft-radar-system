@@ -10,6 +10,21 @@
     font-size: 2em;
 }
 
+.intro-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 1em;
+}
+
+.intro-note {
+    font-size: .9em;
+    font-weight: 400;
+    color: #555;
+    max-width: 32em;
+    margin: 1.2em auto 0;
+}
+
 .app {
     display: none;
     flex-direction: column;
@@ -237,6 +252,12 @@ p {
     display: inline-block;
     transform: rotate(calc((var(--heading) - var(--bearing)) * 1deg));
     cursor: help;
+}
+
+/* Checksum notes in their own column at the right edge. */
+.messages td.crc {
+    padding-left: 1em;
+    padding-right: 0;
 }
 
 .messages .crc a {

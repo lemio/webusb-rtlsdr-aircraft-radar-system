@@ -87,6 +87,7 @@ export class AircraftTracker {
   constructor() {
     this.aircraft = new Map();
     this.receiver = null; // [lon, lat] of the antenna, if known.
+    this.persist = true; // Save to localStorage (off for simulated data).
     this._load();
   }
 
@@ -191,9 +192,11 @@ export class AircraftTracker {
     }
   }
 
-  // Forget every aircraft, including the saved history.
+  // Forget every aircraft, including the saved history (unless not persisting,
+  // e.g. for simulated data, which must not touch the real history).
   reset() {
     this.aircraft.clear();
+    if (!this.persist) return;
     try {
       localStorage.removeItem(STORAGE_KEY);
     } catch (error) {
@@ -215,6 +218,7 @@ export class AircraftTracker {
   // Persist everything except transient CPR frames. If the storage quota is
   // exceeded, the oldest points of the longest trail are dropped until it fits.
   save() {
+    if (!this.persist) return;
     const aircraft = [...this.aircraft.values()].map(({ cprEven, cprOdd, ...plane }) => plane);
     for (let attempt = 0; attempt < 20; attempt++) {
       try {

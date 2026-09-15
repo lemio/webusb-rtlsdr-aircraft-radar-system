@@ -4,13 +4,15 @@ import { AircraftTracker } from "./aircraft.js";
 import { AircraftMap } from "./map.js";
 import { MessageTable } from "./messages.js";
 import { SignalView } from "./signal.js";
-let button = document.querySelector("button");
+let connectButton = document.querySelector("#connect");
+let simulateButton = document.querySelector("#simulate");
 let introSection = document.querySelector('.intro');
 let mainSection = document.querySelector('.app');
 let footer = document.querySelector('footer');
 let waitingMessage = document.querySelector('.blink-me');
 let started = false;
 let msgReceived = false;
+let simulated = false;
 
 const demodulator = new Demodulator();
 const DETECTOR_KEY = "detector";
@@ -23,22 +25,24 @@ let aircraftMap;
 
 const MAP_UPDATE_MS = 1000;
 const SAVE_INTERVAL_MS = 10000;
+// A 10 s recording of real signals (uint8 I/Q at 2 Msps, 1090 MHz), gzipped:
+// about half the size — the noise that makes up most of it doesn't compress
+// further — and decompressed in the browser. Recreate it from a raw recording
+// with `gzip -9 -n -k sample_data.bin`.
+const SAMPLE_FILE = "sample_data.bin.gz";
+const BUFFER_BYTES = 256000; // 64 ms of samples, as read from the receiver.
+const BUFFER_MS = 64;
 
 setInterval(() => tracker.save(), SAVE_INTERVAL_MS);
 window.addEventListener("pagehide", () => tracker.save());
 
-async function start() {
-    const sdr = await RtlSdr.requestDevice();
-    // Otherwise the spacebar (pause) would press the connect button again.
-    button.blur();
+// Switch from the intro to the map, table and signal view.
+function showApp() {
+    // Otherwise the spacebar (pause) would press an intro button again.
+    document.activeElement?.blur();
     introSection.style.display = "none";
     footer.style.display = "none";
     mainSection.style.display = "flex";
-
-    // The receiver's location lets single position frames be decoded right away.
-    navigator.geolocation?.getCurrentPosition(({ coords }) => {
-        tracker.receiver = [coords.longitude, coords.latitude];
-    });
 
     aircraftMap = new AircraftMap("map");
     aircraftMap.map.on("rotate", () => messageTable.setBearing(aircraftMap.map.getBearing()));
@@ -46,6 +50,35 @@ async function start() {
     setInterval(() => {
         if (!paused) aircraftMap.update(tracker);
     }, MAP_UPDATE_MS);
+}
+
+// Decode one buffer of uint8 I/Q samples and show the results.
+function processBuffer(data) {
+    if (!started) {
+        console.log('starting...')
+        started = true
+    }
+    // Collect this buffer's messages (valid and corrupt) for the signal view.
+    const bufferMessages = [];
+    demodulator.process(data, data.length, msg => {
+        bufferMessages.push(msg);
+        onMsg(msg);
+    }, msg => {
+        if (!CHECKED_FORMATS.includes(msg.msgtype)) return;
+        bufferMessages.push(msg);
+        onCorrupt(msg);
+    });
+    signalView.push(data, bufferMessages);
+}
+
+async function start() {
+    const sdr = await RtlSdr.requestDevice();
+    showApp();
+
+    // The receiver's location lets single position frames be decoded right away.
+    navigator.geolocation?.getCurrentPosition(({ coords }) => {
+        tracker.receiver = [coords.longitude, coords.latitude];
+    });
 
     await sdr.open({
         ppm: 0.5
@@ -57,31 +90,79 @@ async function start() {
     await sdr.resetBuffer();
 
     while (readSamples) {
-        if (!started) {
-            console.log('starting...')
-            started = true
-        }
-
-        // const samples = await sdr.readSamples(16 * 16384);
-        const samples = await sdr.readSamples(128000);
-        // console.log(samples)
-
-        const data = new Uint8Array(samples);
-        // console.log(data)
-
-        // Collect this buffer's messages (valid and corrupt) for the signal
-        // view. readSamples counts samples, so the buffer holds 256000 bytes.
-        const bufferMessages = [];
-        demodulator.process(data, data.length, msg => {
-            bufferMessages.push(msg);
-            onMsg(msg);
-        }, msg => {
-            if (!CHECKED_FORMATS.includes(msg.msgtype)) return;
-            bufferMessages.push(msg);
-            onCorrupt(msg);
-        });
-        signalView.push(data, bufferMessages);
+        // readSamples counts samples, so each buffer holds 256000 bytes.
+        const samples = await sdr.readSamples(BUFFER_BYTES / 2);
+        processBuffer(new Uint8Array(samples));
     }
+}
+
+// Without a receiver: play a recording of real signals through the same
+// pipeline, at real-time speed, looping. Its aircraft are kept apart from the
+// saved history, and the viewer's location isn't used (the recording was made
+// elsewhere).
+async function simulate() {
+    simulateButton.disabled = true;
+    let raw;
+    try {
+        raw = await loadSample(progress => {
+            simulateButton.textContent = progress === null ? "Loading sample…" : `Loading sample… ${Math.round(progress * 100)} %`;
+        });
+    } catch (error) {
+        simulateButton.disabled = false;
+        simulateButton.textContent = "Simulate with sample data";
+        alert(`Could not load the sample data: ${error.message}`);
+        return;
+    }
+
+    simulated = true;
+    tracker.persist = false;
+    tracker.aircraft.clear();
+    showApp();
+
+    let offset = 0;
+    let next = performance.now();
+    const play = () => {
+        if (offset + BUFFER_BYTES > raw.length) offset = 0; // Loop.
+        processBuffer(raw.slice(offset, offset + BUFFER_BYTES));
+        offset += BUFFER_BYTES;
+        next += BUFFER_MS;
+        setTimeout(play, Math.max(0, next - performance.now()));
+    };
+    play();
+}
+
+// Download the sample (reporting progress from 0 to 1, or null when the size
+// is unknown) and decompress it.
+async function loadSample(onProgress) {
+    const response = await fetch(SAMPLE_FILE);
+    if (!response.ok) throw new Error(`${SAMPLE_FILE}: ${response.status} ${response.statusText}`);
+    const bytes = await readWithProgress(response, onProgress);
+    // A server may already have decoded the gzip transfer; check the header.
+    if (bytes[0] !== 0x1f || bytes[1] !== 0x8b) return bytes;
+    onProgress(null);
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+async function readWithProgress(response, onProgress) {
+    const total = Number(response.headers.get("Content-Length")) || 0;
+    const reader = response.body.getReader();
+    const chunks = [];
+    let received = 0;
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        onProgress(total ? received / total : null);
+    }
+    const bytes = new Uint8Array(received);
+    let offset = 0;
+    for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.length;
+    }
+    return bytes;
 }
 
 // Formats whose checksum can be verified on its own. Other formats XOR the
@@ -159,7 +240,7 @@ resetButton.onclick = () => reset();
 statusBar.append(rateElement, resetButton);
 document.querySelector('.data').before(statusBar);
 setInterval(() => {
-    rateElement.textContent = `${messageCount} msg/s` +
+    rateElement.textContent = (simulated ? 'sample data · ' : '') + `${messageCount} msg/s` +
         (corruptCount ? ` · ${corruptCount} corrupt` : '') +
         (paused ? ' · paused' : messageTable.paused ? ' · held' : ' · space to pause');
     messageCount = 0;
@@ -208,4 +289,5 @@ document.addEventListener('keydown', event => {
     setPaused(!paused);
 });
 
-button.onclick = () => start();
+connectButton.onclick = () => start();
+simulateButton.onclick = () => simulate();
